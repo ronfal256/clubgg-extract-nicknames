@@ -18,3 +18,7 @@ players.csv
 
 # Large extracted/decompiled artifacts (keep out of git)
 grinders-vault-extract/
+
+# Secrets (never commit)
+service-account.json
+service-account.json.json
