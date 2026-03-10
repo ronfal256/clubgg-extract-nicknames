@@ -6,11 +6,13 @@ from pathlib import Path
 import os
 import io
 import json
-from typing import Optional, Tuple
+import tempfile
+from typing import Iterable, Optional, Tuple, List, Dict, Any
 
 DEFAULT_DB_PATH = "yuval.db"
 DEFAULT_OUT_CSV = "players_id.csv"
 DEFAULT_SOURCE_FILENAME = "kiddo.db"
+DEFAULT_SOURCE_GLOB_EXT = ".hud"
 
 
 def _get_drive_service():
@@ -96,6 +98,32 @@ def _drive_find_file_id_by_name(
     return files[0]["id"] if files else None
 
 
+def _drive_list_files_in_folder(service, *, folder_id: str) -> List[Dict[str, Any]]:
+    files: List[Dict[str, Any]] = []
+    page_token: Optional[str] = None
+    q = f"'{folder_id}' in parents and trashed = false"
+
+    while True:
+        resp = (
+            service.files()
+            .list(
+                q=q,
+                fields="nextPageToken,files(id,name,mimeType,size)",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+                pageToken=page_token,
+                pageSize=1000,
+            )
+            .execute()
+        )
+        files.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    return files
+
+
 def _drive_download_file(service, *, file_id: str, dest_path: str) -> None:
     from googleapiclient.http import MediaIoBaseDownload
 
@@ -108,27 +136,41 @@ def _drive_download_file(service, *, file_id: str, dest_path: str) -> None:
     fh.close()
 
 
-def _drive_upload_file_to_folder(
+def _drive_upload_file_to_folder_overwrite(
     service, *, folder_id: str, local_path: str, dest_name: str
 ) -> str:
     from googleapiclient.http import MediaFileUpload
 
     media = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
-    file_metadata = {"name": dest_name, "parents": [folder_id]}
-    created = (
-        service.files()
-        .create(
-            body=file_metadata,
-            media_body=media,
-            fields="id,webViewLink",
-            supportsAllDrives=True,
+    existing_id = _drive_find_file_id_by_name(service, folder_id=folder_id, filename=dest_name)
+    if existing_id:
+        updated = (
+            service.files()
+            .update(
+                fileId=existing_id,
+                media_body=media,
+                fields="id,webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute()
         )
-        .execute()
-    )
-    return created.get("webViewLink") or created["id"]
+        return updated.get("webViewLink") or updated["id"]
+    else:
+        file_metadata = {"name": dest_name, "parents": [folder_id]}
+        created = (
+            service.files()
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id,webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        return created.get("webViewLink") or created["id"]
 
 
-def _extract_players_to_csv(*, db_path: str, out_csv: str) -> int:
+def _extract_players_from_db(*, db_path: str) -> List[Tuple[str, str]]:
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
@@ -149,13 +191,19 @@ def _extract_players_to_csv(*, db_path: str, out_csv: str) -> int:
 
     conn.close()
 
-    with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["PlayerName", "PlayerNick"])
-        for name, nick in sorted(players):
-            writer.writerow([name, nick])
+    return sorted(players)
 
-    return len(players)
+
+def _write_players_dataframe(*, rows: Iterable[Tuple[str, str]], out_csv: str) -> int:
+    try:
+        import pandas as pd
+    except ImportError as e:  # pragma: no cover
+        raise RuntimeError("Missing dependency: pandas") from e
+
+    df = pd.DataFrame(rows, columns=["PlayerName", "PlayerNick"])
+    df = df.drop_duplicates()
+    df.to_csv(out_csv, index=False, encoding="utf-8")
+    return int(len(df))
 
 
 def main() -> Tuple[int, Optional[str]]:
@@ -170,6 +218,7 @@ def main() -> Tuple[int, Optional[str]]:
     source_file_id = os.environ.get("SOURCE_FILE_ID")
     source_folder_id = os.environ.get("SOURCE_FOLDER_ID")
     source_filename = os.environ.get("SOURCE_FILENAME", DEFAULT_SOURCE_FILENAME)
+    source_ext = os.environ.get("SOURCE_EXT", DEFAULT_SOURCE_GLOB_EXT)
     dest_folder_id = os.environ.get("DEST_FOLDER_ID")
 
     use_drive = bool(source_file_id or source_folder_id or dest_folder_id)
@@ -177,38 +226,54 @@ def main() -> Tuple[int, Optional[str]]:
     db_path = os.environ.get("DB_PATH", DEFAULT_DB_PATH)
     uploaded_link = None
 
+    all_rows: List[Tuple[str, str]] = []
+
     if use_drive:
         if not dest_folder_id:
             raise RuntimeError("DEST_FOLDER_ID is required for Google Drive upload.")
         service = _get_drive_service()
 
-        if not source_file_id:
+        file_ids: List[Tuple[str, str]] = []
+
+        if source_file_id:
+            file_ids.append((source_file_id, source_filename))
+        else:
             if not source_folder_id:
-                raise RuntimeError(
-                    "Provide SOURCE_FILE_ID or SOURCE_FOLDER_ID for Google Drive download."
-                )
-            source_file_id = _drive_find_file_id_by_name(
-                service, folder_id=source_folder_id, filename=source_filename
-            )
-            if not source_file_id:
+                raise RuntimeError("Provide SOURCE_FOLDER_ID to download all .hud files.")
+
+            files = _drive_list_files_in_folder(service, folder_id=source_folder_id)
+            hud_files = [
+                f
+                for f in files
+                if isinstance(f.get("name"), str)
+                and f["name"].lower().endswith(source_ext.lower())
+            ]
+            if not hud_files:
                 raise FileNotFoundError(
-                    f"Could not find '{source_filename}' in source folder {source_folder_id}."
+                    f"No files ending with '{source_ext}' found in source folder {source_folder_id}."
                 )
+            file_ids.extend((f["id"], f["name"]) for f in hud_files)
 
-        db_path = "kiddo.db"
-        _drive_download_file(service, file_id=source_file_id, dest_path=db_path)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for file_id, name in file_ids:
+                local_path = str(Path(tmpdir) / name)
+                _drive_download_file(service, file_id=file_id, dest_path=local_path)
+                all_rows.extend(_extract_players_from_db(db_path=local_path))
+    else:
+        # Local mode: process a single DB file
+        if not Path(db_path).exists():
+            raise FileNotFoundError(
+                f"Database file not found: {db_path}. "
+                "Place it in the repo or set DB_PATH to its location."
+            )
+        all_rows.extend(_extract_players_from_db(db_path=db_path))
 
-    if not Path(db_path).exists():
-        raise FileNotFoundError(
-            f"Database file not found: {db_path}. "
-            "Place it in the repo or set DB_PATH to its location."
-        )
-
-    count = _extract_players_to_csv(db_path=db_path, out_csv=out_csv)
+    # Always overwrite output file
+    count = _write_players_dataframe(rows=all_rows, out_csv=out_csv)
 
     if use_drive:
         service = _get_drive_service()
-        uploaded_link = _drive_upload_file_to_folder(
+        uploaded_link = _drive_upload_file_to_folder_overwrite(
             service, folder_id=dest_folder_id, local_path=out_csv, dest_name=out_csv
         )
 

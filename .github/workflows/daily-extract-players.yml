@@ -21,7 +21,7 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install google-api-python-client google-auth
+          python -m pip install google-api-python-client google-auth pandas
 
       - name: Run extractor
         env:
@@ -32,7 +32,7 @@ jobs:
           # Drive locations (store as GitHub Secrets or repo vars)
           SOURCE_FOLDER_ID: ${{ secrets.SOURCE_FOLDER_ID }}
           DEST_FOLDER_ID: ${{ secrets.DEST_FOLDER_ID }}
-          SOURCE_FILENAME: kiddo.db
+          SOURCE_EXT: .hud
           OUTPUT_CSV: players_id.csv
         run: python extract-players-id.py
 
