@@ -1,0 +1,28 @@
+name: Daily extract players
+
+on:
+  schedule:
+    # Note: GitHub Actions schedule times are UTC.
+    - cron: "0 9 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run extractor
+        run: python extract-players-id.py
+
+      - name: Upload CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: players-csv
+          path: players.csv
