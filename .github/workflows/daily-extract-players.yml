@@ -32,7 +32,7 @@ jobs:
           # Drive locations (store as GitHub Secrets or repo vars)
           SOURCE_FOLDER_ID: ${{ secrets.SOURCE_FOLDER_ID }}
           DEST_FOLDER_ID: ${{ secrets.DEST_FOLDER_ID }}
-          SOURCE_EXT: .hud
+          SOURCE_EXT: .db
           OUTPUT_CSV: players_id.csv
         run: python extract-players-id.py
 
