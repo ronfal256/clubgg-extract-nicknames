@@ -9,10 +9,9 @@ import json
 import tempfile
 from typing import Iterable, Optional, Tuple, List, Dict, Any
 
-DEFAULT_DB_PATH = "yuval.db"
 DEFAULT_OUT_CSV = "players_id.csv"
-DEFAULT_SOURCE_FILENAME = "kiddo.db"
-DEFAULT_SOURCE_GLOB_EXT = ".hud"
+DEFAULT_SOURCE_FILENAME = "drivehud.db"
+DEFAULT_SOURCE_GLOB_EXT = ".db"
 
 
 def _get_drive_service():
@@ -194,17 +193,30 @@ def _extract_players_from_db(*, db_path: str) -> List[Tuple[str, str]]:
     return sorted(players)
 
 
-def _write_players_dataframe(*, rows: Iterable[Tuple[str, str]], out_csv: str) -> int:
-    try:
-        import pandas as pd
-    except ImportError as e:  # pragma: no cover
-        raise RuntimeError("Missing dependency: pandas") from e
+def _write_players_dataframe(*, rows, out_csv: str, old_csv: Optional[str] = None) -> int:
+    import pandas as pd
 
-    df = pd.DataFrame(rows, columns=["PlayerName", "PlayerNick"])
-    df = df.drop_duplicates()
+    new_df = pd.DataFrame(rows, columns=["PlayerName", "PlayerNick"]).drop_duplicates()
+
+    if old_csv and Path(old_csv).exists():
+        old_df = pd.read_csv(old_csv)
+
+        for col in ["has_alias", "description"]:
+            if col not in old_df.columns:
+                old_df[col] = ""
+
+        df = new_df.merge(
+            old_df[["PlayerName", "PlayerNick", "has_alias", "description"]],
+            on=["PlayerName", "PlayerNick"],
+            how="left"
+        )
+    else:
+        new_df["has_alias"] = ""
+        new_df["description"] = ""
+        df = new_df
+
     df.to_csv(out_csv, index=False, encoding="utf-8")
-    return int(len(df))
-
+    return len(df)
 
 def main() -> Tuple[int, Optional[str]]:
     """
@@ -223,7 +235,7 @@ def main() -> Tuple[int, Optional[str]]:
 
     use_drive = bool(source_file_id or source_folder_id or dest_folder_id)
 
-    db_path = os.environ.get("DB_PATH", DEFAULT_DB_PATH)
+    db_path = os.environ.get("DB_PATH")
     uploaded_link = None
 
     all_rows: List[Tuple[str, str]] = []
@@ -269,7 +281,31 @@ def main() -> Tuple[int, Optional[str]]:
         all_rows.extend(_extract_players_from_db(db_path=db_path))
 
     # Always overwrite output file
-    count = _write_players_dataframe(rows=all_rows, out_csv=out_csv)
+    old_csv_path = None
+
+    if use_drive:
+        service = _get_drive_service()
+
+        # try to find existing CSV in Drive
+        existing_file_id = _drive_find_file_id_by_name(
+            service,
+            folder_id=dest_folder_id,
+            filename=out_csv
+        )
+
+        if existing_file_id:
+            old_csv_path = "previous_players_id.csv"
+            _drive_download_file(
+                service,
+                file_id=existing_file_id,
+                dest_path=old_csv_path
+            )
+
+    count = _write_players_dataframe(
+        rows=all_rows,
+        out_csv=out_csv,
+        old_csv=old_csv_path
+    )
 
     if use_drive:
         service = _get_drive_service()
