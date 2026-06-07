@@ -9,9 +9,13 @@ import json
 import tempfile
 from typing import Iterable, Optional, Tuple, List, Dict, Any
 
-DEFAULT_OUT_CSV = "players_id.csv"
+DEFAULT_CLUBGG_OUT_CSV = "players_id_clubgg.csv"
+DEFAULT_7XL_OUT_CSV = "players_id_7xl.csv"
 DEFAULT_SOURCE_FILENAME = "drivehud.db"
 DEFAULT_SOURCE_GLOB_EXT = ".db"
+
+CLUBGG_SITE_ID = 40
+SEVEN_XL_SITE_ID = 16
 
 
 def _get_drive_service():
@@ -169,15 +173,19 @@ def _drive_upload_file_to_folder_overwrite(
         return created.get("webViewLink") or created["id"]
 
 
-def _extract_players_from_db(*, db_path: str) -> List[Tuple[str, str]]:
+def _extract_players_from_db(*, db_path: str, site_id: Optional[int] = None) -> List[Tuple[str, str]]:
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
     players = set()
 
-    for (xml_text,) in cur.execute(
-        "SELECT HandHistory FROM HandHistories WHERE HandHistory IS NOT NULL"
-    ):
+    query = "SELECT HandHistory FROM HandHistories WHERE HandHistory IS NOT NULL"
+    params: list = []
+    if site_id is not None:
+        query += " AND PokerSiteId = ?"
+        params.append(site_id)
+
+    for (xml_text,) in cur.execute(query, params):
         try:
             root = ET.fromstring(xml_text)
             for p in root.findall(".//Players/Player"):
@@ -218,14 +226,46 @@ def _write_players_dataframe(*, rows, out_csv: str, old_csv: Optional[str] = Non
     df.to_csv(out_csv, index=False, encoding="utf-8")
     return len(df)
 
-def main() -> Tuple[int, Optional[str]]:
+def _process_one_source(
+    service,
+    *,
+    db_paths: List[str],
+    site_id: int,
+    out_csv: str,
+    dest_folder_id: str,
+    fallback_old_csv: Optional[str] = None,
+) -> int:
+    rows: List[Tuple[str, str]] = []
+    for db_path in db_paths:
+        rows.extend(_extract_players_from_db(db_path=db_path, site_id=site_id))
+
+    old_csv_path = None
+    existing_id = _drive_find_file_id_by_name(service, folder_id=dest_folder_id, filename=out_csv)
+    if existing_id:
+        old_csv_path = f"_prev_{out_csv}"
+        _drive_download_file(service, file_id=existing_id, dest_path=old_csv_path)
+    elif fallback_old_csv:
+        fallback_id = _drive_find_file_id_by_name(service, folder_id=dest_folder_id, filename=fallback_old_csv)
+        if fallback_id:
+            old_csv_path = f"_prev_{out_csv}"
+            _drive_download_file(service, file_id=fallback_id, dest_path=old_csv_path)
+
+    count = _write_players_dataframe(rows=rows, out_csv=out_csv, old_csv=old_csv_path)
+    _drive_upload_file_to_folder_overwrite(
+        service, folder_id=dest_folder_id, local_path=out_csv, dest_name=out_csv
+    )
+    return count
+
+
+def main() -> Tuple[int, int]:
     """
-    Modes:
-    - Local (default): reads DB_PATH (or yuval.db), writes OUTPUT_CSV (or players_id.csv)
-    - Google Drive: if SOURCE_FILE_ID or SOURCE_FOLDER_ID is provided, downloads kiddo.db,
-      runs extraction, uploads CSV to DEST_FOLDER_ID.
+    Downloads .db files from SOURCE_FOLDER_ID (or SOURCE_FILE_ID) on Google Drive,
+    then extracts players for each site and uploads two CSVs to DEST_FOLDER_ID:
+    - players_id_clubgg.csv  (PokerSiteId=40)
+    - players_id_7xl.csv     (PokerSiteId=16)
     """
-    out_csv = os.environ.get("OUTPUT_CSV", DEFAULT_OUT_CSV)
+    clubgg_csv = os.environ.get("CLUBGG_OUTPUT_CSV", DEFAULT_CLUBGG_OUT_CSV)
+    seven_xl_csv = os.environ.get("7XL_OUTPUT_CSV", DEFAULT_7XL_OUT_CSV)
 
     source_file_id = os.environ.get("SOURCE_FILE_ID")
     source_folder_id = os.environ.get("SOURCE_FOLDER_ID")
@@ -233,91 +273,57 @@ def main() -> Tuple[int, Optional[str]]:
     source_ext = os.environ.get("SOURCE_EXT", DEFAULT_SOURCE_GLOB_EXT)
     dest_folder_id = os.environ.get("DEST_FOLDER_ID")
 
-    use_drive = bool(source_file_id or source_folder_id or dest_folder_id)
+    if not dest_folder_id:
+        raise RuntimeError("DEST_FOLDER_ID is required.")
 
-    db_path = os.environ.get("DB_PATH")
-    uploaded_link = None
+    service = _get_drive_service()
 
-    all_rows: List[Tuple[str, str]] = []
-
-    if use_drive:
-        if not dest_folder_id:
-            raise RuntimeError("DEST_FOLDER_ID is required for Google Drive upload.")
-        service = _get_drive_service()
-
-        file_ids: List[Tuple[str, str]] = []
-
-        if source_file_id:
-            file_ids.append((source_file_id, source_filename))
-        else:
-            if not source_folder_id:
-                raise RuntimeError("Provide SOURCE_FOLDER_ID to download all .hud files.")
-
-            files = _drive_list_files_in_folder(service, folder_id=source_folder_id)
-            hud_files = [
-                f
-                for f in files
-                if isinstance(f.get("name"), str)
-                and f["name"].lower().endswith(source_ext.lower())
-            ]
-            if not hud_files:
-                raise FileNotFoundError(
-                    f"No files ending with '{source_ext}' found in source folder {source_folder_id}."
-                )
-            file_ids.extend((f["id"], f["name"]) for f in hud_files)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for file_id, name in file_ids:
-                local_path = str(Path(tmpdir) / name)
-                _drive_download_file(service, file_id=file_id, dest_path=local_path)
-                all_rows.extend(_extract_players_from_db(db_path=local_path))
+    file_ids: List[Tuple[str, str]] = []
+    if source_file_id:
+        file_ids.append((source_file_id, source_filename))
     else:
-        # Local mode: process a single DB file
-        if not Path(db_path).exists():
+        if not source_folder_id:
+            raise RuntimeError("Provide SOURCE_FOLDER_ID or SOURCE_FILE_ID.")
+        files = _drive_list_files_in_folder(service, folder_id=source_folder_id)
+        db_files = [
+            f
+            for f in files
+            if isinstance(f.get("name"), str)
+            and f["name"].lower().endswith(source_ext.lower())
+        ]
+        if not db_files:
             raise FileNotFoundError(
-                f"Database file not found: {db_path}. "
-                "Place it in the repo or set DB_PATH to its location."
+                f"No files ending with '{source_ext}' found in source folder {source_folder_id}."
             )
-        all_rows.extend(_extract_players_from_db(db_path=db_path))
+        file_ids.extend((f["id"], f["name"]) for f in db_files)
 
-    # Always overwrite output file
-    old_csv_path = None
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_paths = []
+        for file_id, name in file_ids:
+            local_path = str(Path(tmpdir) / name)
+            _drive_download_file(service, file_id=file_id, dest_path=local_path)
+            db_paths.append(local_path)
 
-    if use_drive:
-        service = _get_drive_service()
-
-        # try to find existing CSV in Drive
-        existing_file_id = _drive_find_file_id_by_name(
+        clubgg_count = _process_one_source(
             service,
-            folder_id=dest_folder_id,
-            filename=out_csv
+            db_paths=db_paths,
+            site_id=CLUBGG_SITE_ID,
+            out_csv=clubgg_csv,
+            dest_folder_id=dest_folder_id,
+            fallback_old_csv="players_id.csv",
+        )
+        seven_xl_count = _process_one_source(
+            service,
+            db_paths=db_paths,
+            site_id=SEVEN_XL_SITE_ID,
+            out_csv=seven_xl_csv,
+            dest_folder_id=dest_folder_id,
         )
 
-        if existing_file_id:
-            old_csv_path = "previous_players_id.csv"
-            _drive_download_file(
-                service,
-                file_id=existing_file_id,
-                dest_path=old_csv_path
-            )
+    return clubgg_count, seven_xl_count
 
-    count = _write_players_dataframe(
-        rows=all_rows,
-        out_csv=out_csv,
-        old_csv=old_csv_path
-    )
-
-    if use_drive:
-        service = _get_drive_service()
-        uploaded_link = _drive_upload_file_to_folder_overwrite(
-            service, folder_id=dest_folder_id, local_path=out_csv, dest_name=out_csv
-        )
-
-    return count, uploaded_link
 
 if __name__ == "__main__":
-    count, link = main()
-    if link:
-        print(f"Saved {count} distinct players to {DEFAULT_OUT_CSV} and uploaded to {link}")
-    else:
-        print(f"Saved {count} distinct players to {DEFAULT_OUT_CSV}")
+    clubgg_count, seven_xl_count = main()
+    print(f"ClubGG: {clubgg_count} distinct players -> {DEFAULT_CLUBGG_OUT_CSV}")
+    print(f"7XL:    {seven_xl_count} distinct players -> {DEFAULT_7XL_OUT_CSV}")

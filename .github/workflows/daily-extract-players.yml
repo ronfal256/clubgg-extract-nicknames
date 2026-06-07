@@ -33,11 +33,14 @@ jobs:
           SOURCE_FOLDER_ID: ${{ secrets.SOURCE_FOLDER_ID }}
           DEST_FOLDER_ID: ${{ secrets.DEST_FOLDER_ID }}
           SOURCE_EXT: .db
-          OUTPUT_CSV: players_id.csv
+          CLUBGG_OUTPUT_CSV: players_id_clubgg.csv
+          7XL_OUTPUT_CSV: players_id_7xl.csv
         run: python extract-players-id.py
 
       - name: Upload CSV
         uses: actions/upload-artifact@v4
         with:
           name: players-csv
-          path: players_id.csv
+          path: |
+            players_id_clubgg.csv
+            players_id_7xl.csv
