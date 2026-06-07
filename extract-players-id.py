@@ -36,7 +36,7 @@ def _get_drive_service():
             "google-api-python-client google-auth"
         ) from e
 
-    scopes = ["https://www.googleapis.com/auth/drive"]
+    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
 
     sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     creds: Optional[object] = None
@@ -77,30 +77,6 @@ def _get_drive_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def _drive_find_file_id_by_name(
-    service, *, folder_id: str, filename: str
-) -> Optional[str]:
-    safe_name = filename.replace("'", "\\'")
-    q = (
-        f"'{folder_id}' in parents and "
-        f"name = '{safe_name}' and "
-        "trashed = false"
-    )
-    resp = (
-        service.files()
-        .list(
-            q=q,
-            fields="files(id,name)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-            pageSize=10,
-        )
-        .execute()
-    )
-    files = resp.get("files", [])
-    return files[0]["id"] if files else None
-
-
 def _drive_list_files_in_folder(service, *, folder_id: str) -> List[Dict[str, Any]]:
     files: List[Dict[str, Any]] = []
     page_token: Optional[str] = None
@@ -137,40 +113,6 @@ def _drive_download_file(service, *, file_id: str, dest_path: str) -> None:
     while not done:
         _, done = downloader.next_chunk()
     fh.close()
-
-
-def _drive_upload_file_to_folder_overwrite(
-    service, *, folder_id: str, local_path: str, dest_name: str
-) -> str:
-    from googleapiclient.http import MediaFileUpload
-
-    media = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
-    existing_id = _drive_find_file_id_by_name(service, folder_id=folder_id, filename=dest_name)
-    if existing_id:
-        updated = (
-            service.files()
-            .update(
-                fileId=existing_id,
-                media_body=media,
-                fields="id,webViewLink",
-                supportsAllDrives=True,
-            )
-            .execute()
-        )
-        return updated.get("webViewLink") or updated["id"]
-    else:
-        file_metadata = {"name": dest_name, "parents": [folder_id]}
-        created = (
-            service.files()
-            .create(
-                body=file_metadata,
-                media_body=media,
-                fields="id,webViewLink",
-                supportsAllDrives=True,
-            )
-            .execute()
-        )
-        return created.get("webViewLink") or created["id"]
 
 
 def _extract_players_from_db(*, db_path: str, site_id: Optional[int] = None) -> List[Tuple[str, str]]:
@@ -226,43 +168,14 @@ def _write_players_dataframe(*, rows, out_csv: str, old_csv: Optional[str] = Non
     df.to_csv(out_csv, index=False, encoding="utf-8")
     return len(df)
 
-def _process_one_source(
-    service,
-    *,
-    db_paths: List[str],
-    site_id: int,
-    out_csv: str,
-    dest_folder_id: str,
-    fallback_old_csv: Optional[str] = None,
-) -> int:
-    rows: List[Tuple[str, str]] = []
-    for db_path in db_paths:
-        rows.extend(_extract_players_from_db(db_path=db_path, site_id=site_id))
-
-    old_csv_path = None
-    existing_id = _drive_find_file_id_by_name(service, folder_id=dest_folder_id, filename=out_csv)
-    if existing_id:
-        old_csv_path = f"_prev_{out_csv}"
-        _drive_download_file(service, file_id=existing_id, dest_path=old_csv_path)
-    elif fallback_old_csv:
-        fallback_id = _drive_find_file_id_by_name(service, folder_id=dest_folder_id, filename=fallback_old_csv)
-        if fallback_id:
-            old_csv_path = f"_prev_{out_csv}"
-            _drive_download_file(service, file_id=fallback_id, dest_path=old_csv_path)
-
-    count = _write_players_dataframe(rows=rows, out_csv=out_csv, old_csv=old_csv_path)
-    _drive_upload_file_to_folder_overwrite(
-        service, folder_id=dest_folder_id, local_path=out_csv, dest_name=out_csv
-    )
-    return count
-
 
 def main() -> Tuple[int, int]:
     """
     Downloads .db files from SOURCE_FOLDER_ID (or SOURCE_FILE_ID) on Google Drive,
-    then extracts players for each site and uploads two CSVs to DEST_FOLDER_ID:
+    extracts players per site, and writes two local CSVs:
     - players_id_clubgg.csv  (PokerSiteId=40)
     - players_id_7xl.csv     (PokerSiteId=16)
+    Existing local CSVs are merged to preserve has_alias/description metadata.
     """
     clubgg_csv = os.environ.get("CLUBGG_OUTPUT_CSV", DEFAULT_CLUBGG_OUT_CSV)
     seven_xl_csv = os.environ.get("7XL_OUTPUT_CSV", DEFAULT_7XL_OUT_CSV)
@@ -271,10 +184,6 @@ def main() -> Tuple[int, int]:
     source_folder_id = os.environ.get("SOURCE_FOLDER_ID")
     source_filename = os.environ.get("SOURCE_FILENAME", DEFAULT_SOURCE_FILENAME)
     source_ext = os.environ.get("SOURCE_EXT", DEFAULT_SOURCE_GLOB_EXT)
-    dest_folder_id = os.environ.get("DEST_FOLDER_ID")
-
-    if not dest_folder_id:
-        raise RuntimeError("DEST_FOLDER_ID is required.")
 
     service = _get_drive_service()
 
@@ -304,21 +213,22 @@ def main() -> Tuple[int, int]:
             _drive_download_file(service, file_id=file_id, dest_path=local_path)
             db_paths.append(local_path)
 
-        clubgg_count = _process_one_source(
-            service,
-            db_paths=db_paths,
-            site_id=CLUBGG_SITE_ID,
-            out_csv=clubgg_csv,
-            dest_folder_id=dest_folder_id,
-            fallback_old_csv="players_id.csv",
-        )
-        seven_xl_count = _process_one_source(
-            service,
-            db_paths=db_paths,
-            site_id=SEVEN_XL_SITE_ID,
-            out_csv=seven_xl_csv,
-            dest_folder_id=dest_folder_id,
-        )
+        clubgg_rows: List[Tuple[str, str]] = []
+        seven_xl_rows: List[Tuple[str, str]] = []
+        for db_path in db_paths:
+            clubgg_rows.extend(_extract_players_from_db(db_path=db_path, site_id=CLUBGG_SITE_ID))
+            seven_xl_rows.extend(_extract_players_from_db(db_path=db_path, site_id=SEVEN_XL_SITE_ID))
+
+    clubgg_count = _write_players_dataframe(
+        rows=clubgg_rows,
+        out_csv=clubgg_csv,
+        old_csv=clubgg_csv if Path(clubgg_csv).exists() else None,
+    )
+    seven_xl_count = _write_players_dataframe(
+        rows=seven_xl_rows,
+        out_csv=seven_xl_csv,
+        old_csv=seven_xl_csv if Path(seven_xl_csv).exists() else None,
+    )
 
     return clubgg_count, seven_xl_count
 
