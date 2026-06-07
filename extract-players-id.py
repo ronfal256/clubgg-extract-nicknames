@@ -2,6 +2,7 @@
 import sqlite3
 import xml.etree.ElementTree as ET
 import csv
+import re
 from pathlib import Path
 import os
 import io
@@ -128,15 +129,26 @@ def _extract_players_from_db(*, db_path: str, site_id: Optional[int] = None) -> 
         params.append(site_id)
 
     for (xml_text,) in cur.execute(query, params):
-        try:
-            root = ET.fromstring(xml_text)
-            for p in root.findall(".//Players/Player"):
-                name = p.attrib.get("PlayerName")
-                nick = p.attrib.get("PlayerNick")
-                if name and nick:
-                    players.add((name, nick))
-        except ET.ParseError:
-            continue
+        text = xml_text.strip()
+        if text.startswith("<"):
+            # XML format (ClubGG)
+            try:
+                root = ET.fromstring(text)
+                for p in root.findall(".//Players/Player"):
+                    name = p.attrib.get("PlayerName")
+                    nick = p.attrib.get("PlayerNick")
+                    if name and nick:
+                        players.add((name, nick))
+            except ET.ParseError:
+                continue
+        else:
+            # Plain text format (7XL/GGNetwork)
+            for line in text.splitlines():
+                m = re.match(r"^Seat \d+: (.+?) \(\$[\d,.]+ in chips\)", line)
+                if m:
+                    player_id = m.group(1)
+                    if player_id != "Hero":
+                        players.add((player_id, player_id))
 
     conn.close()
 
