@@ -22,3 +22,4 @@ grinders-vault-extract/
 # Secrets (never commit)
 service-account.json
 service-account.json.json
+oauth-client.json
