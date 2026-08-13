@@ -22,12 +22,16 @@ SEVEN_XL_SITE_ID = 16
 def _get_drive_service():
     """
     Auth options (first match wins):
+    - GCP_WORKLOAD_IDENTITY: set to "1" to use Application Default Credentials,
+      i.e. the short-lived token minted by google-github-actions/auth's Workload
+      Identity Federation step (no stored key involved).
     - GOOGLE_SERVICE_ACCOUNT_JSON: service account JSON as a string
     - GOOGLE_APPLICATION_CREDENTIALS: path to a service account JSON file
     - GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REFRESH_TOKEN:
       user OAuth credentials (personal Google account)
     """
     try:
+        import google.auth
         from google.oauth2 import service_account
         from google.oauth2.credentials import Credentials
         from googleapiclient.discovery import build
@@ -39,41 +43,46 @@ def _get_drive_service():
 
     scopes = ["https://www.googleapis.com/auth/drive.readonly"]
 
-    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     creds: Optional[object] = None
 
-    # 1) Service account via inline JSON
-    if sa_json:
-        info = json.loads(sa_json)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    # 0) Workload Identity Federation (short-lived, no stored key)
+    if os.environ.get("GCP_WORKLOAD_IDENTITY"):
+        creds, _ = google.auth.default(scopes=scopes)
     else:
-        # 2) Service account via JSON file path
-        creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-        if creds_path:
-            creds = service_account.Credentials.from_service_account_file(
-                creds_path, scopes=scopes
-            )
+        sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+        # 1) Service account via inline JSON
+        if sa_json:
+            info = json.loads(sa_json)
+            creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
         else:
-            # 3) User OAuth via refresh token
-            client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
-            client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
-            refresh_token = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
-            if client_id and client_secret and refresh_token:
-                creds = Credentials(
-                    token=None,
-                    refresh_token=refresh_token,
-                    token_uri="https://oauth2.googleapis.com/token",
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    scopes=scopes,
+            # 2) Service account via JSON file path
+            creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            if creds_path:
+                creds = service_account.Credentials.from_service_account_file(
+                    creds_path, scopes=scopes
                 )
             else:
-                raise RuntimeError(
-                    "Google Drive auth is not configured. Set either "
-                    "GOOGLE_SERVICE_ACCOUNT_JSON / GOOGLE_APPLICATION_CREDENTIALS "
-                    "or GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / "
-                    "GOOGLE_OAUTH_REFRESH_TOKEN."
-                )
+                # 3) User OAuth via refresh token
+                client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+                client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+                refresh_token = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
+                if client_id and client_secret and refresh_token:
+                    creds = Credentials(
+                        token=None,
+                        refresh_token=refresh_token,
+                        token_uri="https://oauth2.googleapis.com/token",
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        scopes=scopes,
+                    )
+                else:
+                    raise RuntimeError(
+                        "Google Drive auth is not configured. Set either "
+                        "GCP_WORKLOAD_IDENTITY, GOOGLE_SERVICE_ACCOUNT_JSON / "
+                        "GOOGLE_APPLICATION_CREDENTIALS, or GOOGLE_OAUTH_CLIENT_ID / "
+                        "GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REFRESH_TOKEN."
+                    )
 
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
