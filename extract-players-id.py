@@ -97,7 +97,7 @@ def _drive_list_files_in_folder(service, *, folder_id: str) -> List[Dict[str, An
             service.files()
             .list(
                 q=q,
-                fields="nextPageToken,files(id,name,mimeType,size)",
+                fields="nextPageToken,files(id,name,mimeType,size,shortcutDetails)",
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
                 pageToken=page_token,
@@ -109,6 +109,14 @@ def _drive_list_files_in_folder(service, *, folder_id: str) -> List[Dict[str, An
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
+
+    # Resolve Drive shortcuts to the file they point at, so downloads target
+    # the actual binary content instead of the (non-downloadable) shortcut.
+    for f in files:
+        shortcut = f.get("shortcutDetails")
+        if f.get("mimeType") == "application/vnd.google-apps.shortcut" and shortcut:
+            f["id"] = shortcut.get("targetId", f["id"])
+            f["mimeType"] = shortcut.get("targetMimeType", f.get("mimeType"))
 
     return files
 
