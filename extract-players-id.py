@@ -14,6 +14,7 @@ DEFAULT_CLUBGG_OUT_CSV = "players_id_clubgg.csv"
 DEFAULT_7XL_OUT_CSV = "players_id_7xl.csv"
 DEFAULT_SOURCE_FILENAME = "drivehud.db"
 DEFAULT_SOURCE_GLOB_EXT = ".db"
+DEFAULT_DRIVE_PLAYERS_CSV = "players_id.csv"
 
 CLUBGG_SITE_ID = 40
 SEVEN_XL_SITE_ID = 16
@@ -41,7 +42,7 @@ def _get_drive_service():
             "google-api-python-client google-auth"
         ) from e
 
-    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
+    scopes = ["https://www.googleapis.com/auth/drive"]
 
     creds: Optional[object] = None
 
@@ -121,6 +122,60 @@ def _drive_list_files_in_folder(service, *, folder_id: str) -> List[Dict[str, An
     return files
 
 
+def _drive_find_file_id_by_name(
+    service, *, folder_id: str, filename: str
+) -> Optional[str]:
+    safe_name = filename.replace("'", "\\'")
+    q = f"'{folder_id}' in parents and name = '{safe_name}' and trashed = false"
+    resp = (
+        service.files()
+        .list(
+            q=q,
+            fields="files(id,name)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            pageSize=10,
+        )
+        .execute()
+    )
+    files = resp.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def _drive_upload_file_to_folder_overwrite(
+    service, *, folder_id: str, local_path: str, dest_name: str
+) -> str:
+    from googleapiclient.http import MediaFileUpload
+
+    media = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
+    existing_id = _drive_find_file_id_by_name(service, folder_id=folder_id, filename=dest_name)
+    if existing_id:
+        updated = (
+            service.files()
+            .update(
+                fileId=existing_id,
+                media_body=media,
+                fields="id,webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        return updated.get("webViewLink") or updated["id"]
+    else:
+        file_metadata = {"name": dest_name, "parents": [folder_id]}
+        created = (
+            service.files()
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id,webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        return created.get("webViewLink") or created["id"]
+
+
 def _drive_download_file(service, *, file_id: str, dest_path: str) -> None:
     from googleapiclient.http import MediaIoBaseDownload
 
@@ -198,6 +253,48 @@ def _write_players_dataframe(*, rows, out_csv: str, old_csv: Optional[str] = Non
     return len(df)
 
 
+def _sync_clubgg_csv_to_drive(
+    service, *, folder_id: str, filename: str, extracted_rows: List[Tuple[str, str]]
+) -> None:
+    """
+    Reads the current players_id.csv from Drive (if it exists) and appends only
+    the (PlayerName, PlayerNick) pairs from extracted_rows that aren't already
+    present, leaving existing rows and any manually-edited columns untouched.
+    """
+    import pandas as pd
+
+    existing_file_id = _drive_find_file_id_by_name(service, folder_id=folder_id, filename=filename)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_path = str(Path(tmpdir) / filename)
+
+        if existing_file_id:
+            _drive_download_file(service, file_id=existing_file_id, dest_path=local_path)
+            existing_df = pd.read_csv(local_path)
+            for col in ["has_alias", "description"]:
+                if col not in existing_df.columns:
+                    existing_df[col] = ""
+            existing_keys = set(zip(existing_df["PlayerName"], existing_df["PlayerNick"]))
+        else:
+            existing_df = pd.DataFrame(columns=["PlayerName", "PlayerNick", "has_alias", "description"])
+            existing_keys = set()
+
+        rows_to_add = [r for r in sorted(set(extracted_rows)) if r not in existing_keys]
+        if not rows_to_add and existing_file_id:
+            return
+
+        add_df = pd.DataFrame(rows_to_add, columns=["PlayerName", "PlayerNick"])
+        add_df["has_alias"] = ""
+        add_df["description"] = ""
+
+        combined_df = pd.concat([existing_df, add_df], ignore_index=True)
+        combined_df.to_csv(local_path, index=False, encoding="utf-8")
+
+        _drive_upload_file_to_folder_overwrite(
+            service, folder_id=folder_id, local_path=local_path, dest_name=filename
+        )
+
+
 def main() -> Tuple[int, int]:
     """
     Downloads .db files from SOURCE_FOLDER_ID (or SOURCE_FILE_ID) on Google Drive,
@@ -258,6 +355,15 @@ def main() -> Tuple[int, int]:
         out_csv=seven_xl_csv,
         old_csv=seven_xl_csv if Path(seven_xl_csv).exists() else None,
     )
+
+    if source_folder_id:
+        drive_players_csv = os.environ.get("DRIVE_PLAYERS_CSV", DEFAULT_DRIVE_PLAYERS_CSV)
+        _sync_clubgg_csv_to_drive(
+            service,
+            folder_id=source_folder_id,
+            filename=drive_players_csv,
+            extracted_rows=clubgg_rows,
+        )
 
     return clubgg_count, seven_xl_count
 
