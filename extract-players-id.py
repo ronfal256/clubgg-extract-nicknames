@@ -356,15 +356,6 @@ def main() -> Tuple[int, int]:
         old_csv=seven_xl_csv if Path(seven_xl_csv).exists() else None,
     )
 
-    if source_folder_id:
-        drive_players_csv = os.environ.get("DRIVE_PLAYERS_CSV", DEFAULT_DRIVE_PLAYERS_CSV)
-        _sync_clubgg_csv_to_drive(
-            service,
-            folder_id=source_folder_id,
-            filename=drive_players_csv,
-            extracted_rows=clubgg_rows,
-        )
-
     return clubgg_count, seven_xl_count
 
 
