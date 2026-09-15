@@ -231,23 +231,23 @@ def _write_players_dataframe(*, rows, out_csv: str, old_csv: Optional[str] = Non
     import pandas as pd
 
     new_df = pd.DataFrame(rows, columns=["PlayerName", "PlayerNick"]).drop_duplicates()
+    new_df["has_alias"] = ""
+    new_df["description"] = ""
 
     if old_csv and Path(old_csv).exists():
         old_df = pd.read_csv(old_csv)
-
         for col in ["has_alias", "description"]:
             if col not in old_df.columns:
                 old_df[col] = ""
-
-        df = new_df.merge(
-            old_df[["PlayerName", "PlayerNick", "has_alias", "description"]],
-            on=["PlayerName", "PlayerNick"],
-            how="left"
-        )
+        old_df = old_df[["PlayerName", "PlayerNick", "has_alias", "description"]]
     else:
-        new_df["has_alias"] = ""
-        new_df["description"] = ""
-        df = new_df
+        old_df = pd.DataFrame(columns=["PlayerName", "PlayerNick", "has_alias", "description"])
+
+    # Union old + new, keeping old_df's row (and its has_alias/description) whenever
+    # a pair appears in both, so an empty/short extraction can never erase prior data.
+    df = pd.concat([old_df, new_df], ignore_index=True).drop_duplicates(
+        subset=["PlayerName", "PlayerNick"], keep="first"
+    )
 
     df.to_csv(out_csv, index=False, encoding="utf-8")
     return len(df)
