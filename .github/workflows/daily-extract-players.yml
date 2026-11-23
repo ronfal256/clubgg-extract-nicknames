@@ -3,7 +3,7 @@ name: Daily extract players
 on:
   schedule:
     # Note: GitHub Actions schedule times are UTC.
-    - cron: "0 2 * * *"
+    - cron: "17 2 * * *"
   workflow_dispatch: {}
 
 permissions:
